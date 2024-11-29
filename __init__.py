@@ -20,11 +20,30 @@ class heatSender:
         # Avaliable events can be found at https://github.com/RotorHazard/RotorHazard/blob/264d39a01c2a391c4ed059d84c5f21969f14dae9/src/server/eventmanager.py#L100
         self._rhapi.events.on(Evt.HEAT_SET, self.onHeatChange)
         self._rhapi.events.on(Evt.LAPS_SAVE, self.raceSave)
+        self._rhapi.events.on(Evt.RACE_LAP_RECORDED, self.raceProgress)
         rhapi.ui.register_panel("next_format", "Next", "format")
-      
-        rhapi.fields.register_option( UIField('next_ip', "IP Next Server", UIFieldType.TEXT), 'next_format' )
-        rhapi.fields.register_option( UIField('next_status', 'Turn On service', field_type = UIFieldType.CHECKBOX), 'next_format'  )
 
+        rhapi.fields.register_option( UIField('next_status', 'Turn On service', field_type = UIFieldType.CHECKBOX), 'next_format'  )
+        rhapi.fields.register_option( UIField('next_ip', "IP Next Server", UIFieldType.TEXT), 'next_format' )
+        rhapi.fields.register_option( UIField('next_event_id', "Next Event Id", UIFieldType.TEXT), 'next_format')
+        rhapi.ui.register_quickbutton('next_format', 'import_pilots', 'Import pilots', self.importPilots)
+
+    def importPilots(self, args):
+        self._rhapi.ui.message_notify(self._rhapi.language.__("Next - Pilot importing starts"))
+        
+        if (self._rhapi.db.option("next_status") == "1"): 
+            data = {
+                    'next_event_id': self._rhapi.db.option("next_event_id"),
+                } 
+            response = requests.post(self._rhapi.db.option("next_ip") + "/data/import_pilots", json=data) 
+            response_data = response.json()
+
+            logger.info("Pilots to import: %s", response_data)        
+
+            for pilot_name in response_data["pilots"]:                
+                self._rhapi.db.pilot_add(name=pilot_name, callsign=pilot_name)
+            self._rhapi.ui.message_notify(self._rhapi.language.__("Next - Pilot importing finished"))
+       
 
     def onHeatChange(self, args):
         currentRound = self._rhapi.race.round
@@ -109,7 +128,6 @@ class heatSender:
 
                 #logger.info("Heat laps: %s", pilots_vector)    
                 requests.post(self._rhapi.db.option("next_ip") + "/data/heat_data", json=race_data)     
-                               
            
     def to_dict(self, obj):
  
@@ -118,7 +136,44 @@ class heatSender:
                 k: self.to_dict(v) if isinstance(v, (list, dict)) else v
                 for k, v in obj.__dict__.items() if not k.startswith('_')
             }
-        return obj              
+        return obj  
+      
+    def raceProgress(self, args):
+
+         if (self._rhapi.db.option("next_status") == "1"):  
+            parsed_data = args
+            logger.info("Heat laps: %s", args)  
+            result_vector = []
+            heat_id = "00"
+            for obj in parsed_data["results"]["by_race_time"]:
+                fastest_lap_source = obj.get("fastest_lap_source", {})
+                # Concatenar heat y round si están disponibles
+                heatId = (
+                    f"heat: {fastest_lap_source.get('heat')}, round: {fastest_lap_source.get('round')}"
+                    if isinstance(fastest_lap_source, dict)
+                    else "00"
+                )
+                
+                result_vector.append({
+                    "callsign": obj["callsign"],
+                    "laps": obj["laps"],
+                    "last_lap": obj["last_lap"],
+                    "position": obj["position"],
+                    "heatId": heatId
+                })
+                heat_id = heat_id
+
+            laps_data = {
+                'pilots_vector': result_vector,
+                'heat_id': heat_id
+            }  
+
+            logger.info("Heat laps: %s", laps_data)        
+            requests.post(self._rhapi.db.option("next_ip") + "/data/laps_data", json=laps_data)    
+
+ 
+        
+          
 
 def initialize(rhapi):
     heatSender(rhapi)
