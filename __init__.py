@@ -35,7 +35,7 @@ class heatSender:
             data = {
                     'next_event_id': self._rhapi.db.option("next_event_id"),
                 } 
-            response = requests.post(self._rhapi.db.option("next_ip") + "/data/import_pilots", json=data) 
+            response = requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/import_pilots", json=data) 
             response_data = response.json()
 
             logger.info("Pilots to import: %s", response_data)        
@@ -93,7 +93,7 @@ class heatSender:
                         #logger.info(data_dic)
             
                 #logger.info("Next push data:" + self._rhapi.db.option("next_ip") + "/v1/next/data/pilots")
-                requests.post(self._rhapi.db.option("next_ip") + "/data/pilots", json=payload)
+                requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/pilots", json=payload)
         
     def raceSave(self, args):
         if (self._rhapi.db.option("next_status") == "1"):
@@ -113,6 +113,7 @@ class heatSender:
                         "callsign": pilot.get("callsign"),
                         "laps": pilot.get("laps"),
                         "total_time": pilot.get("total_time"),
+                        "total_time_laps": pilot.get("total_time_laps"),
                         "average_lap": pilot.get("average_lap"),
                         "fastest_lap": pilot.get("fastest_lap"),
                         "consecutives": pilot.get("consecutives"),
@@ -127,7 +128,7 @@ class heatSender:
                 }           
 
                 #logger.info("Heat laps: %s", pilots_vector)    
-                requests.post(self._rhapi.db.option("next_ip") + "/data/heat_data", json=race_data)     
+                requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/heat_data", json=race_data)     
            
     def to_dict(self, obj):
  
@@ -169,7 +170,7 @@ class heatSender:
             }  
 
             logger.info("Heat laps: %s", laps_data)        
-            requests.post(self._rhapi.db.option("next_ip") + "/data/laps_data", json=laps_data)    
+            requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/laps_data", json=laps_data)    
 
  
         

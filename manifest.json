@@ -1,8 +1,8 @@
 {
     "name": "Next",
     "author" : "Gunther Votteler",
-    "author_uri" : "https://ligacolombianadroneracing.com",
-    "description" : "Notifies the bands and channels assigned to the pilots of the next heat through the app Next",
+    "author_uri" : "https://go-next.co",
+    "description" : "Plugin integration for Next Platform",
     "info_uri" : "https://",
     "license" : "MIT",
     "license_uri" : "https://github.com/gvotteler",
