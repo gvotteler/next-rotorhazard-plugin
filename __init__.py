@@ -22,6 +22,7 @@ class heatSender:
         self._rhapi.events.on(Evt.LAPS_SAVE, self.raceSave)
         self._rhapi.events.on(Evt.RACE_LAP_RECORDED, self.raceProgress)
         rhapi.ui.register_panel("next_format", "Next", "format")
+        self._rhapi.events.on(Evt.LAPS_RESAVE, self.raceResave)
 
         rhapi.fields.register_option( UIField('next_status', 'Turn On service', field_type = UIFieldType.CHECKBOX), 'next_format'  )
         rhapi.fields.register_option( UIField('next_ip', "IP Next Server", UIFieldType.TEXT), 'next_format' )
@@ -33,7 +34,7 @@ class heatSender:
         
         if (self._rhapi.db.option("next_status") == "1"): 
             data = {
-                    'next_event_id': self._rhapi.db.option("next_event_id"),
+                    'nextId': self._rhapi.db.option("next_event_id"),
                 } 
             response = requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/import_pilots", json=data) 
             response_data = response.json()
@@ -91,9 +92,12 @@ class heatSender:
                         
                         payload.append(data_dic)
                         #logger.info(data_dic)
-            
+                race_data = {
+                    'data': payload,
+                    "nextId": self._rhapi.db.option("next_event_id")
+                } 
                 #logger.info("Next push data:" + self._rhapi.db.option("next_ip") + "/v1/next/data/pilots")
-                requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/pilots", json=payload)
+                requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/pilots", json=race_data)
         
     def raceSave(self, args):
         if (self._rhapi.db.option("next_status") == "1"):
@@ -124,8 +128,9 @@ class heatSender:
                 # Crear un nuevo array con las claves 'pilots_vector' y 'race_id'
                 race_data = {
                     'pilots_vector': pilots_vector,
-                    'race_id': raceId
-                }           
+                    'race_id': raceId,
+                    "nextId": self._rhapi.db.option("next_event_id")
+                }            
 
                 #logger.info("Heat laps: %s", pilots_vector)    
                 requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/heat_data", json=race_data)     
@@ -166,12 +171,53 @@ class heatSender:
 
             laps_data = {
                 'pilots_vector': result_vector,
-                'heat_id': heat_id
-            }  
+                'heat_id': heat_id,
+                'nextId': self._rhapi.db.option("next_event_id")
+            }   
 
             logger.info("Heat laps: %s", laps_data)        
             requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/laps_data", json=laps_data)    
 
+
+    def raceResave(self, args):
+        if (self._rhapi.db.option("next_status") == "1"):
+        
+                currentRound = self._rhapi.race.round
+                currentHeat = self._rhapi.race.heat
+                logger.info("Heat laps: %s", args)  
+                logger.info("1: %s", currentRound)    
+                logger.info("2: %s", currentHeat)        
+
+               
+                raceId = str(currentHeat) + str(currentRound)
+                logger.info("Save race Id: %s", raceId)
+
+                data = self._rhapi.race.results
+               
+                # Extraer datos deseados
+                pilots_vector = []
+                for pilot in data.get("by_consecutives", []):
+                    pilot_data = {
+                        "callsign": pilot.get("callsign"),
+                        "laps": pilot.get("laps"),
+                        "total_time": pilot.get("total_time"),
+                        "total_time_laps": pilot.get("total_time_laps"),
+                        "average_lap": pilot.get("average_lap"),
+                        "fastest_lap": pilot.get("fastest_lap"),
+                        "consecutives": pilot.get("consecutives"),
+                        "position": pilot.get("position")
+                    }
+                    pilots_vector.append(pilot_data)
+
+                # Crear un nuevo array con las claves 'pilots_vector' y 'race_id'
+                race_data = {
+                    'pilots_vector': pilots_vector,
+                    'race_id': raceId,
+                    "nextId": self._rhapi.db.option("next_event_id")
+                }            
+
+                logger.info("Heat laps: %s", pilots_vector)    
+                #requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/heat_data", json=race_data)     
  
         
           
