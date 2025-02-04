@@ -4,6 +4,7 @@ from Database import Pilot, Profiles
 import json
 import RHAPI
 import requests
+import time
 from RHUI import UIField, UIFieldType, UIFieldSelectOption
 
 
@@ -22,7 +23,7 @@ class heatSender:
         self._rhapi.events.on(Evt.LAPS_SAVE, self.raceSave)
         self._rhapi.events.on(Evt.RACE_LAP_RECORDED, self.raceProgress)
         rhapi.ui.register_panel("next_format", "Next", "format")
-        self._rhapi.events.on(Evt.LAPS_RESAVE, self.raceResave)
+        self._rhapi.events.on(Evt.LAPS_RESAVE, self.on_laps_resave)
 
         rhapi.fields.register_option( UIField('next_status', 'Turn On service', field_type = UIFieldType.CHECKBOX), 'next_format'  )
         rhapi.fields.register_option( UIField('next_ip', "IP Next Server", UIFieldType.TEXT), 'next_format' )
@@ -179,48 +180,63 @@ class heatSender:
             requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/laps_data", json=laps_data)    
 
 
-    def raceResave(self, args):
+    def on_laps_resave(self, args):
         if (self._rhapi.db.option("next_status") == "1"):
+            time.sleep(2)  # Retraso mínimo para asegurar persistencia en la BD
+            self.raceResave(args)
+
+
+    def raceResave(self, args):
         
-                currentRound = self._rhapi.race.round
-                currentHeat = self._rhapi.race.heat
-                logger.info("Heat laps: %s", args)  
-                logger.info("1: %s", currentRound)    
-                logger.info("2: %s", currentHeat)        
+                race_id = args.get('race_id')
+                laps_raw = self._rhapi.db.race_by_id(race_id)
+                if hasattr(laps_raw, "__dict__"):
+                    laps_raw = vars(laps_raw)  # Convierte el objeto en un diccionario
 
-               
-                raceId = str(currentHeat) + str(currentRound)
-                logger.info("Save race Id: %s", raceId)
+                results = laps_raw.get("results", {})
+                
+                # Log para depuración
+                logger.info("Results data: %s", results)
 
-                data = self._rhapi.race.results
-               
-                # Extraer datos deseados
                 pilots_vector = []
-                for pilot in data.get("by_consecutives", []):
-                    pilot_data = {
-                        "callsign": pilot.get("callsign"),
-                        "laps": pilot.get("laps"),
-                        "total_time": pilot.get("total_time"),
-                        "total_time_laps": pilot.get("total_time_laps"),
-                        "average_lap": pilot.get("average_lap"),
-                        "fastest_lap": pilot.get("fastest_lap"),
-                        "consecutives": pilot.get("consecutives"),
-                        "position": pilot.get("position")
-                    }
-                    pilots_vector.append(pilot_data)
+                round_heat_concat = ""
+
+                # Verificar que 'by_consecutives' exista antes de iterar
+                if isinstance(results, dict) and "by_consecutives" in results:
+                    for pilot in results["by_consecutives"]:
+                        # Extraer round y heat si existen en consecutives_source
+                        consecutives_source = pilot.get("consecutives_source")
+                        if consecutives_source:  # Verifica si consecutives_source existe y no es None
+                            round_num = consecutives_source.get("round", 0) + 1  # Incrementar round en 1
+                            heat = consecutives_source.get("heat", 0)
+                            round_heat_concat = f"{heat}{round_num}"  # Concatenar heat y round
+
+                        pilot_data = {
+                            "callsign": pilot.get("callsign"),
+                            "laps": pilot.get("laps"),
+                            "total_time": pilot.get("total_time"),
+                            "total_time_laps": pilot.get("total_time_laps"),
+                            "average_lap": pilot.get("average_lap"),
+                            "fastest_lap": pilot.get("fastest_lap"),
+                            "consecutives": pilot.get("consecutives"),
+                            "position": pilot.get("position")
+                        }
+                        pilots_vector.append(pilot_data)
+                else:
+                    logger.warning("No data found in 'by_consecutives'")
+
+                # Imprimir resultado
+                logger.info("Pilots Vector: %s", pilots_vector)
 
                 # Crear un nuevo array con las claves 'pilots_vector' y 'race_id'
                 race_data = {
                     'pilots_vector': pilots_vector,
-                    'race_id': raceId,
+                    'heat_id': round_heat_concat,
                     "nextId": self._rhapi.db.option("next_event_id")
                 }            
 
-                logger.info("Heat laps: %s", pilots_vector)    
-                #requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/heat_data", json=race_data)     
- 
-        
-          
+                logger.info("Resave: %s", race_data)    
+                requests.post('http://' + self._rhapi.db.option("next_ip") + "/data/resave_data", json=race_data)  
 
 def initialize(rhapi):
     heatSender(rhapi)
