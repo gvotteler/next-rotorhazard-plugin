@@ -14,3 +14,5 @@ Documentation
 3. You can start or stop the integration service by checking or unchecking the checkbox.
 4. Add the IP address of your LAN interface (desktop) that is being used to connect the lap timer and your desktop or laptop.
 5. The IP address must include the port set in the NLS (Next Local Server). The default port is 5701.
+
+Thank you to Mauricio Bridge for the performance updates.

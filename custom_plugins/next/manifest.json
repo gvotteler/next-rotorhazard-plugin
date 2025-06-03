@@ -1,0 +1,13 @@
+{
+    "domain": "next",
+    "name": "Next Connector",
+    "author": "Gunther Votteler",
+    "author_uri": "https://github.com/gvotteler",
+    "description": "Plugin integration for Next Platform",
+    "documentation_uri": "https://github.com/gvotteler/next-rotorhazard-plugin",
+    "required_rhapi_version": "1.1",
+    "version": "1.0.3",
+    "category": [
+        "Race Managment"
+    ]
+}
