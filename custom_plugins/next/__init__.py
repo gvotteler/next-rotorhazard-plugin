@@ -1,249 +1,202 @@
+# server/plugins/next_connector/__init__.py
+# -*- coding: utf-8 -*-
+"""
+Next Connector (Socket.IO only)
+- Emite telemetría (RSSI / Peak / Freq) vía 'next_heartbeat'
+- Entrega snapshot de nodos vía 'next_nodes' o 'next_get_nodes' (ack)
+- Expone acciones: iniciar (stage), detener (stop), terminar (stop+save), abortar (clear)
+- Re-emite resultados y progreso en vivo vía 'next_race_results', 'next_live_update', 'next_resave_data'
+- Permite setear pilotos y frecuencias vía 'next_set_pilots' y 'next_set_frequencies'
+Compatible con Python 3.9+
+"""
+
+import json
+import time
 import logging
 from eventmanager import Evt
-from Database import Pilot, Profiles
-import json
-import RHAPI
-import requests
-from requests.exceptions import RequestException
-from RHUI import UIField, UIFieldType, UIFieldSelectOption
-import time
+from RHUtils import HEAT_ID_NONE
+from RHRace import RaceStatus
 
 logger = logging.getLogger(__name__)
 
-class NextIntegration: 
-    def __init__(self, rhapi:RHAPI.RHAPI):
+class NextConnector:
+    def __init__(self, rhapi):
         self._rhapi = rhapi
-        self._session = requests.Session()  # Reutilizar sesión HTTP para reducir sobrecarga
-        self._last_sent_data = {}  # Caché para evitar envíos duplicados
-        self._next_url = None  # Se inicializará cuando sea necesario
-        self._next_enabled = False  # Se verificará una sola vez
+        self._peaks = {}     # peak RSSI por seat
+        self._last_nodes = []  # último snapshot de nodos
 
-        # Registrar eventos con manejo eficiente
-        events_to_register = [
-            (Evt.HEAT_SET, self.onHeatChange),
-            (Evt.LAPS_SAVE, self.raceSave),
-            (Evt.RACE_LAP_RECORDED, self.raceProgress),
-            (Evt.LAPS_RESAVE, self.on_laps_resave)
-        ]
-        
-        for event, handler in events_to_register:
-            rhapi.events.on(event, handler)
-        
-        # Configurar UI
-        rhapi.ui.register_panel("next_format", "Next", "format")
-        rhapi.fields.register_option(UIField('next_status', 'Turn On service', field_type=UIFieldType.CHECKBOX), 'next_format')
-        rhapi.fields.register_option(UIField('next_ip', "IP Next Server", UIFieldType.TEXT), 'next_format')
-        rhapi.fields.register_option(UIField('next_event_id', "Next Event Id", UIFieldType.TEXT), 'next_format')
-        rhapi.ui.register_quickbutton('next_format', 'import_pilots', 'Import pilots', self.importPilots)
+    def initialize(self, _args):
+        logger.info('Initializing Next Connector (Socket.IO only)')
 
-    def _check_enabled(self):
-        """Verificar si el servicio está habilitado y actualizar URL base"""
-        status = self._rhapi.db.option("next_status") == "1"
-        
-        if status and self._next_url is None:
-            # Solo actualizar URL si es necesario
-            ip = self._rhapi.db.option("next_ip")
-            if ip:
-                self._next_url = f"http://{ip}"
-            else:
-                status = False  # Desactivar si no hay IP configurada
-        
-        self._next_enabled = status
-        return status
+        # Escuchar pedidos desde Next (Socket.IO)
+        ui = self._rhapi.ui
+        ui.socket_listen('next_ping', lambda _=None: {"pong": True})
 
-    def _send_request(self, endpoint, data, retries=2):
-        """Enviar solicitud HTTP con manejo de errores y reintentos"""
-        if not self._check_enabled() or not self._next_url:
-            return None
-            
-        url = f"{self._next_url}/{endpoint}"
+        ui.socket_listen('next_get_nodes', self._on_get_nodes)
+        ui.socket_listen('next_reset_peaks', self._on_reset_peaks)
+
+        ui.socket_listen('next_set_frequencies', self.next_set_frequencies)
+
+        # Eventos internos de RH → emitir a Next
+        ev = self._rhapi.events
+        # Heartbeat: RSSI / crossing (si disponible en tu build)
+        try:
+            ev.on(Evt.HEARTBEAT, self.on_heartbeat)
+        except Exception as e:
+            logger.warning("HEARTBEAT event not available on this RH build: %s", e)
+        # Cambios de heat → snapshot de nodos
+        ev.on(Evt.HEAT_SET, self._emit_nodes_snapshot)  
         
-        # Añadir nextId a todos los datos
-        if isinstance(data, dict):
-            data["nextId"] = self._rhapi.db.option("next_event_id")
-        
-        # Calcular hash para verificar si ya enviamos estos mismos datos
-        data_hash = str(hash(json.dumps(data, sort_keys=True)))
-        if endpoint in self._last_sent_data and self._last_sent_data[endpoint] == data_hash:
-            logger.debug(f"Skipping duplicate data for {endpoint}")
-            return None
-            
-        for attempt in range(retries + 1):
+
+    # -------------------- TELEMETRÍA / SNAPSHOTS --------------------
+
+    def _get_nodes_snapshot(self):
+        snap = {"nodes": []}
+        try:
+            fset = self._rhapi.race.frequencyset
+            freqs = fset.frequencies
+            if isinstance(freqs, str):
+                freqs = json.loads(freqs)
+            b = freqs.get('b', []) or []
+            c = freqs.get('c', []) or []
+            f = freqs.get('f', []) or []
+            n = max(len(b), len(c), len(f))
+            for i in range(n):
+                snap["nodes"].append({
+                    "seat": i,
+                    "band": b[i] if i < len(b) else None,
+                    "channel": c[i] if i < len(c) else None,
+                    "frequency": f[i] if i < len(f) else None
+                })
+        except Exception as e:
+            logger.warning("nodes snapshot error: %s", e)
+        self._last_nodes = snap["nodes"]
+        return snap
+
+    def _emit_nodes_snapshot(self, *_args, **_kwargs):
+        self._rhapi.ui.socket_broadcast('next_nodes', self._get_nodes_snapshot())
+
+    def _on_get_nodes(self, _=None):
+
+        return self._get_nodes_snapshot()
+
+    def _on_reset_peaks(self, _=None):
+        self._peaks.clear()
+        return {"ok": True}
+
+    def on_heartbeat(self, hb):
+        try:
+            rssi = hb.get('current_rssi') or hb.get('rssi') or []
+            crossing = hb.get('crossing_flag') or []
+
+            # Frecuencias por seat (desde último snapshot, o recalcular si está vacío)
+            if not self._last_nodes:
+                self._last_nodes = self._get_nodes_snapshot().get("nodes", [])
+            freqs = [n.get("frequency") for n in self._last_nodes]
+
+            # Peak por seat
+            peaks = []
+            for i, val in enumerate(rssi):
+                try:
+                    v = float(val) if val is not None else None
+                except Exception:
+                    v = None
+                prev = self._peaks.get(i)
+                if v is not None and (prev is None or v > prev):
+                    self._peaks[i] = v
+                peaks.append(self._peaks.get(i))
+
+            payload = {
+                "rssi": rssi,
+                "peak": peaks,
+                "frequency": freqs,
+                "crossing_flag": crossing,
+                "server_time_s": time.time()
+            }
+            self._rhapi.ui.socket_broadcast('next_heartbeat', payload)
+        except Exception as e:
+            logger.debug("heartbeat parse error: %s", e)
+
+    
+    def _get_frequencyset_by_id(self, fs_id: int):
+
+        db = self._rhapi.db
+        # Algunos builds traen helper:
+        try:
+            return db.frequencyset_by_id(fs_id)
+        except Exception:
+            pass
+        # Fallback: iterar la colección
+        try:
+            for item in getattr(db, "frequencysets", []):
+                if getattr(item, "id", None) == fs_id:
+                    return item
+        except Exception:
+            pass
+        return None
+
+    def next_set_frequencies(self, data):
+        logger.info("[Next] next_set_frequencies (default profile=1) payload=%s", data)
+        try:
+            # 1) Normalizar arrays
+            b = list(data.get('b') or [])
+            c = list(data.get('c') or [])
+            f_in = list(data.get('f') or [])
+
+            f = []
+            for x in f_in:
+                if x is None or str(x).strip() == "":
+                    f.append(None)
+                else:
+                    try:
+                        f.append(int(x))
+                    except Exception:
+                        f.append(int(float(x)))  # admite "5732.0"
+
+            n = max(len(b), len(c), len(f))
+            if n == 0:
+                return {"ok": False, "error": "payload vacío (b/c/f)"}
+
+            b += [None] * (n - len(b))
+            c += [None] * (n - len(c))
+            f += [None] * (n - len(f))
+            freqs = {"b": b, "c": c, "f": f}
+
+            # 2) Forzar profile por defecto (id=1)
+            DEFAULT_FS_ID = 1
+            fset = self._get_frequencyset_by_id(DEFAULT_FS_ID)
+            if not fset:
+                # Si de verdad no existe, mejor devolvemos error explícito
+                logger.error("[Next] Frequency set id=1 no existe.")
+                return {"ok": False, "error": "Default frequency set (id=1) no existe en este timer"}
+
+            # 3) Guardar frecuencias en el set 1
             try:
-                response = self._session.post(url, json=data, timeout=5)
-                response.raise_for_status()
-                self._last_sent_data[endpoint] = data_hash
-                return response.json()
-            except RequestException as e:
-                if attempt < retries:
-                    time.sleep(0.5)  # Espera breve entre reintentos
-                else:
-                    logger.warning(f"Failed to send data to {endpoint}: {str(e)}")
-                    return None
+                self._rhapi.db.frequencyset_alter(fset.id, frequencies=freqs)
+            except TypeError:
+                self._rhapi.db.frequencyset_alter(fset.id, frequencies=json.dumps(freqs))
 
-    def importPilots(self, args):
-        """Importar pilotos desde Next"""
-        if not self._check_enabled():
-            return
-            
-        self._rhapi.ui.message_notify(self._rhapi.language.__("Next - Pilot importing starts"))
-        
-        data = {'nextId': self._rhapi.db.option("next_event_id")}
-        response_data = self._send_request("data/import_pilots", data)
-        
-        if response_data and "pilots" in response_data:
-            for pilot_name in response_data["pilots"]:                
-                self._rhapi.db.pilot_add(name=pilot_name, callsign=pilot_name)
-            self._rhapi.ui.message_notify(self._rhapi.language.__("Next - Pilot importing finished"))
+            # 4) Asegurar que la carrera usa el set 1
+            try:
+                self._rhapi.race.frequencyset = fset.id
+            except Exception:
+                pass
 
-    def onHeatChange(self, args):
-        """Manejar cambio de heat"""
-        if not self._check_enabled():
-            return
-            
-        currentRound = self._rhapi.race.round
-        currentHeat = self._rhapi.race.heat
-        race_id = f"{currentHeat}{currentRound + 1}"
-        
-        try:
-            # Obtener datos de frecuencia
-            frequencyset = self._rhapi.race.frequencyset
-            frequencies = json.loads(frequencyset.frequencies)
-            slots_bands = frequencies["b"]
-            slots_channels = frequencies["c"]
-            slots_frequencies = frequencies["f"]
-            
-            # Obtener pilotos
-            pilots = self._rhapi.race.pilots
-            
-            payload = []
-            for slot_index, pilot_id in pilots.items():
-                if pilot_id != 0:
-                    pilot = self._rhapi.db.pilot_by_id(pilot_id)
-                    if pilot:
-                        payload.append({
-                            "callsign": pilot.callsign,
-                            "band": slots_bands[slot_index],
-                            "channel": slots_channels[slot_index],
-                            "frequency": slots_frequencies[slot_index],
-                            "heat": race_id
-                        })
-            
-            if payload:  # Solo enviar si hay datos
-                self._send_request("data/pilots", {'data': payload})
+            # 5) Notificar UIs & clientes
+            try:
+                self._rhapi.ui.broadcast_heats()
+                self._rhapi.ui.broadcast_current_heat()
+            except Exception:
+                pass
+            self._emit_nodes_snapshot()  # emite 'next_nodes' con snapshot actualizado
+
+            logger.info("[Next] Frequencies applied on default set id=1 (seats=%d)", n)
+            return {"ok": True, "count": n, "profile": {"id": 1, "name": getattr(fset, 'name', None)}}
         except Exception as e:
-            logger.warning(f"Error processing heat change: {str(e)}")
+            logger.exception("[Next] next_set_frequencies failed")
+            return {"ok": False, "error": str(e)}
 
-    def raceSave(self, args):
-        """Manejar guardado de carrera"""
-        if not self._check_enabled():
-            return
-            
-        try:
-            currentRound = self._rhapi.race.round
-            currentHeat = self._rhapi.race.heat
-            raceId = f"{currentHeat}{currentRound}"
-            
-            data = self._rhapi.race.results
-            pilots_vector = []
-            
-            for pilot in data.get("by_consecutives", []):
-                # Usar dict comprehension para mayor eficiencia
-                pilot_data = {k: pilot.get(k) for k in [
-                    "callsign", "laps", "total_time", "total_time_laps",
-                    "average_lap", "fastest_lap", "consecutives", "position"
-                ]}
-                pilots_vector.append(pilot_data)
-            
-            if pilots_vector:  # Solo enviar si hay datos
-                self._send_request("data/heat_data", {
-                    'pilots_vector': pilots_vector,
-                    'race_id': raceId
-                })
-        except Exception as e:
-            logger.warning(f"Error processing race save: {str(e)}")
-            
-    def raceProgress(self, args):
-        """Manejar progreso de carrera"""
-        if not self._check_enabled():
-            return
-            
-        try:
-            parsed_data = args
-            result_vector = []
-            heat_id = "00"
-            
-            for obj in parsed_data["results"]["by_race_time"]:
-                fastest_lap_source = obj.get("fastest_lap_source", {})
-                
-                if isinstance(fastest_lap_source, dict):
-                    heat_info = f"heat: {fastest_lap_source.get('heat')}, round: {fastest_lap_source.get('round')}"
-                else:
-                    heat_info = "00"
-                
-                result_vector.append({
-                    "callsign": obj["callsign"],
-                    "laps": obj["laps"],
-                    "last_lap": obj["last_lap"],
-                    "position": obj["position"],
-                    "heatId": heat_info
-                })
-            
-            if result_vector:  # Solo enviar si hay datos
-                self._send_request("data/laps_data", {
-                    'pilots_vector': result_vector,
-                    'heat_id': heat_id
-                })
-        except Exception as e:
-            logger.warning(f"Error processing race progress: {str(e)}")
-
-    def on_laps_resave(self, args):
-        """Manejar re-guardado de vueltas"""
-        if not self._check_enabled():
-            return
-            
-        # Reducir tiempo de espera a 1 segundo en lugar de 2
-        time.sleep(1)
-        self.raceResave(args)
-
-    def raceResave(self, args):
-        """Procesar datos de re-guardado"""
-        if not self._check_enabled():
-            return
-            
-        try:
-            race_id = args.get('race_id')
-            laps_raw = self._rhapi.db.race_by_id(race_id)
-            
-            if hasattr(laps_raw, "__dict__"):
-                laps_raw = vars(laps_raw)
-                
-            results = laps_raw.get("results", {})
-            pilots_vector = []
-            round_heat_concat = ""
-            
-            if isinstance(results, dict) and "by_consecutives" in results:
-                for pilot in results["by_consecutives"]:
-                    consecutives_source = pilot.get("consecutives_source")
-                    if consecutives_source:
-                        round_num = consecutives_source.get("round", 0) + 1
-                        heat = consecutives_source.get("heat", 0)
-                        round_heat_concat = f"{heat}{round_num}"
-                    
-                    # Usar dict comprehension para mayor eficiencia
-                    pilot_data = {k: pilot.get(k) for k in [
-                        "callsign", "laps", "total_time", "total_time_laps",
-                        "average_lap", "fastest_lap", "consecutives", "position"
-                    ]}
-                    pilots_vector.append(pilot_data)
-            
-            if pilots_vector:  # Solo enviar si hay datos
-                self._send_request("data/resave_data", {
-                    'pilots_vector': pilots_vector,
-                    'heat_id': round_heat_concat
-                })
-        except Exception as e:
-            logger.warning(f"Error processing race resave: {str(e)}")
-
+# Hook de carga del plugin
 def initialize(rhapi):
-    NextIntegration(rhapi)
+    connector = NextConnector(rhapi)
+    rhapi.events.on(Evt.STARTUP, connector.initialize)
